@@ -35,9 +35,9 @@ RUN printf '%s\n' \
     'AllowUsers deploy' \
     > /etc/ssh/sshd_config.d/00-lab10.conf
 
-# Disable automatic SSH startup before runtime setup
+# Prepare SSH for runtime setup
 RUN systemctl disable ssh.service && \
-    systemctl mask ssh.socket && \
+    systemctl unmask ssh.socket && \
     rm -f /etc/ssh/ssh_host_*_key \
           /etc/ssh/ssh_host_*_key.pub
 
