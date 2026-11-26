@@ -104,16 +104,23 @@ jobs:
 
           docker exec lab10-test ssh-keygen -A
 
+          docker exec lab10-test mkdir -p /run/sshd
+
+          docker exec lab10-test \
+            systemctl unmask ssh.socket
+
           docker exec lab10-test \
             systemctl daemon-reload
 
-          docker exec lab10-test \
-            systemctl start ssh.service
+          docker exec lab10-test /usr/sbin/sshd -t
 
           docker exec lab10-test \
-            systemctl is-active ssh.service
+            systemctl start ssh.socket
 
-          echo "Systemd and SSH are ready"
+          docker exec lab10-test \
+            systemctl is-active ssh.socket
+
+          echo "Systemd and SSH socket are ready"
 
       - name: Generate and configure SSH keys
         run: |
