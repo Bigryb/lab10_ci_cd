@@ -1,0 +1,21 @@
+[Unit]
+Description=Lab 10 Flask Application
+After=network.target
+
+[Service]
+Type=simple
+
+User=deploy
+Group=deploy
+
+WorkingDirectory=/opt/lab10
+
+ExecStart=/opt/lab10/.venv/bin/gunicorn --workers 2 --bind 0.0.0.0:8080 app:app
+
+Restart=on-failure
+RestartSec=3
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,277 @@
+name: LR10 - Basic Deployment
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab10-deployment
+  cancel-in-progress: false
+
+jobs:
+
+  test:
+    name: Test Flask application
+    runs-on: ubuntu-24.04
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          python -m unittest discover -s tests -v
+
+  deploy:
+    name: Deploy via SSH and systemd
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Prepare evidence directory
+        run: mkdir -p evidence
+
+      - name: Check Docker
+        run: |
+          docker --version
+          docker info
+
+      - name: Build test server image
+        run: |
+          docker build -t lab10-test-server .
+
+      - name: Start test server
+        run: |
+          docker run -d \
+            --name lab10-test \
+            --hostname lab10-test \
+            --privileged \
+            --cgroupns=host \
+            --tmpfs /run \
+            --tmpfs /run/lock \
+            --tmpfs /tmp \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            -p 127.0.0.1:2222:22 \
+            -p 127.0.0.1:18080:8080 \
+            lab10-test-server
+
+          docker ps
+
+      - name: Wait for systemd and start SSH
+        run: |
+          READY=0
+
+          for i in $(seq 1 30); do
+            if docker exec lab10-test \
+              systemctl show --property=Version --value \
+              >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+
+            echo "Waiting for systemd... ($i/30)"
+            sleep 2
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "systemd failed to start"
+            exit 1
+          fi
+
+          docker exec lab10-test ssh-keygen -A
+
+          docker exec lab10-test \
+            systemctl daemon-reload
+
+          docker exec lab10-test \
+            systemctl start ssh.service
+
+          docker exec lab10-test \
+            systemctl is-active ssh.service
+
+          echo "Systemd and SSH are ready"
+
+      - name: Generate and configure SSH keys
+        run: |
+          SSH_DIR=$(mktemp -d "$RUNNER_TEMP/lab10-ssh.XXXXXX")
+
+          echo "SSH_DIR=$SSH_DIR" >> "$GITHUB_ENV"
+
+          ssh-keygen \
+            -t ed25519 \
+            -N "" \
+            -C "lab10-github-actions" \
+            -f "$SSH_DIR/id_ed25519"
+
+          chmod 600 "$SSH_DIR/id_ed25519"
+
+          docker exec -i lab10-test sh -c '
+            cat > /home/deploy/.ssh/authorized_keys
+            chown deploy:deploy /home/deploy/.ssh/authorized_keys
+            chmod 600 /home/deploy/.ssh/authorized_keys
+          ' < "$SSH_DIR/id_ed25519.pub"
+
+          HOST_KEY=$(docker exec lab10-test \
+            cat /etc/ssh/ssh_host_ed25519_key.pub)
+
+          printf '[127.0.0.1]:2222 %s\n' "$HOST_KEY" \
+            > "$SSH_DIR/known_hosts"
+
+          cat > "$SSH_DIR/config" <<EOF
+          Host lab10
+              HostName 127.0.0.1
+              User deploy
+              Port 2222
+              IdentityFile "$SSH_DIR/id_ed25519"
+              UserKnownHostsFile "$SSH_DIR/known_hosts"
+              StrictHostKeyChecking yes
+              IdentitiesOnly yes
+              BatchMode yes
+              ConnectTimeout 10
+          EOF
+
+          chmod 600 "$SSH_DIR/config"
+
+      - name: Check SSH connection
+        run: |
+          ssh -F "$SSH_DIR/config" lab10 \
+            'echo "SSH connection successful"; whoami; hostname; ps -p 1 -o comm='
+
+      - name: Copy application via SCP
+        run: |
+          printf '%s\n' "$GITHUB_SHA" > VERSION
+
+          scp -F "$SSH_DIR/config" \
+            app.py requirements.txt VERSION \
+            lab10:/opt/lab10/
+
+          ssh -F "$SSH_DIR/config" lab10 \
+            'ls -la /opt/lab10'
+
+          echo "Application files copied successfully"
+
+      - name: Install dependencies and restart systemd service
+        run: |
+          START_TIME=$(date +%s)
+
+          ssh -F "$SSH_DIR/config" lab10 'bash -se' <<'REMOTE'
+
+          cd /opt/lab10
+
+          python3 -m venv .venv
+
+          .venv/bin/python -m pip install -r requirements.txt
+
+          sudo -n /usr/bin/systemctl restart lab10-flask.service
+
+          systemctl is-active lab10-flask.service
+
+          REMOTE
+
+          END_TIME=$(date +%s)
+
+          echo "Install and restart time: $((END_TIME - START_TIME)) seconds"
+
+      - name: Run smoke test
+        run: |
+          bash scripts/smoke_test.sh "$GITHUB_SHA" \
+            | tee evidence/smoke-test.txt
+
+      - name: Check deployed application
+        run: |
+          curl --fail --silent --show-error \
+            --max-time 10 \
+            http://127.0.0.1:18080/ \
+            | tee evidence/index.html
+
+          echo ""
+
+          curl --fail --silent --show-error \
+            --max-time 10 \
+            http://127.0.0.1:18080/health \
+            | tee evidence/health.json
+
+          echo ""
+
+      - name: Capture application screenshot
+        continue-on-error: true
+        run: |
+          google-chrome \
+            --headless \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --user-data-dir="$RUNNER_TEMP/lab10-chrome" \
+            --window-size=1280,800 \
+            --screenshot="$PWD/evidence/application.png" \
+            http://127.0.0.1:18080/
+
+          test -s evidence/application.png
+
+      - name: Show service status and logs
+        if: always()
+        run: |
+          mkdir -p evidence
+
+          if docker inspect lab10-test >/dev/null 2>&1; then
+
+            docker ps -a \
+              | tee evidence/docker-status.txt
+
+            docker exec lab10-test \
+              systemctl status lab10-flask.service \
+              --no-pager 2>&1 \
+              | tee evidence/systemd-status.txt || true
+
+            docker exec lab10-test \
+              journalctl -u lab10-flask.service \
+              -n 50 --no-pager 2>&1 \
+              | tee evidence/systemd-logs.txt || true
+
+            docker logs lab10-test 2>&1 \
+              | tee evidence/container-logs.txt || true
+
+          fi
+
+      - name: Upload deployment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lr10-deployment-evidence
+          path: evidence/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Clean up test server and SSH keys
+        if: always()
+        run: |
+          docker rm -f lab10-test || true
+
+          if [ -n "${SSH_DIR:-}" ]; then
+            rm -rf -- "$SSH_DIR"
+          fi
+
+          echo "Cleanup completed"

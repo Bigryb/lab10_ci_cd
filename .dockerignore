@@ -1,0 +1,4 @@
+**
+!Dockerfile
+!deploy/
+!deploy/lab10-flask.service
