@@ -205,6 +205,8 @@ jobs:
 
       - name: Run smoke test
         run: |
+          set -o pipefail
+
           bash scripts/smoke_test.sh "$GITHUB_SHA" \
             | tee evidence/smoke-test.txt
 
